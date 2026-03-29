@@ -48,11 +48,11 @@ def extract_video_url_from_page(url: str) -> dict:
         page.on("response", on_response)
 
         try:
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
         except Exception:
             pass
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(1000)
 
         try:
             state_json = page.evaluate("""() => {
@@ -276,19 +276,25 @@ HTML_PAGE = """<!DOCTYPE html>
                     return;
                 }
 
-                // 2단계: 파일 다운로드 (브라우저에서 직접)
-                statusDiv.innerHTML = '<span class="spinner"></span> 파일 다운로드 중...';
-                const dlResp = await fetch('/proxy-download?video_url=' + encodeURIComponent(data.video_url) + '&filename=' + encodeURIComponent(data.filename));
-                if (!dlResp.ok) throw new Error('다운로드 실패');
-
-                const blob = await dlResp.blob();
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = data.filename;
-                a.click();
-                URL.revokeObjectURL(a.href);
-
-                statusDiv.textContent = '✅ 다운로드 완료: ' + data.filename;
+                // 2단계: 파일 다운로드
+                statusDiv.innerHTML = '<span class="spinner"></span> 영상이 준비되었습니다! 다운로드 중...';
+                
+                // 직접 다운로드 (클라우드 대역폭 우회 시도)
+                // 만약 CORS 문제가 있다면 어쩔 수 없이 브라우저가 새 탭/창에서 영상을 재생할 수 있음
+                // UX 관점에서 버튼이나 링크를 노출해주는 방향으로 수정
+                statusDiv.innerHTML = `
+                    ✅ <b>추출 완료!</b><br><br>
+                    <a href="${data.video_url}" target="_blank" download="${data.filename}" style="display:inline-block; padding:10px 20px; background:#10b981; color:#fff; border-radius:8px; text-decoration:none; font-weight:bold; margin-top:10px;">
+                        📥 비디오 파일 직접 열기/저장
+                    </a>
+                    <br><br>
+                    <span style="font-size:12px; color:#64748b;">(클릭 시 영상이 재생되면 우클릭 👉 '동영상으로 저장'을 눌러주세요!)</span>
+                    <br><br>
+                    <a href="/proxy-download?video_url=${encodeURIComponent(data.video_url)}&filename=${encodeURIComponent(data.filename)}" style="font-size:13px; color:#3b82f6; text-decoration:underline;">
+                        혹시 직접 저장이 안되나요? (서버 경유 다운로드)
+                    </a>
+                `;
+                
                 statusDiv.className = 'success';
                 addHistory(data.filename);
                 urlInput.value = '';

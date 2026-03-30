@@ -22,8 +22,30 @@ from playwright.sync_api import sync_playwright
 
 
 def normalize_url(url: str) -> str:
-    """rednote.com URL을 xiaohongshu.com으로 변환합니다."""
-    return url.replace("www.rednote.com", "www.xiaohongshu.com").replace("rednote.com", "www.xiaohongshu.com")
+    """rednote.com 등 모바일/단축 URL을 xiaohongshu.com 데스크탑 원본 URL로 변환합니다."""
+    url = url.replace("www.rednote.com", "www.xiaohongshu.com").replace("rednote.com", "www.xiaohongshu.com")
+    
+    # xhslink, v.xiaohongshu.com 등 모바일 공유 링크인 경우
+    if "xhslink.com" in url or "v.xiaohongshu.com" in url or "/discovery/item/" in url:
+        try:
+            # 리다이렉트를 추적하여 최종 URL 확보
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            r = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
+            final_url = r.url
+            
+            # /item/ 또는 /explore/ 뒤의 노트 ID 추출
+            m = re.search(r'(?:item|explore)/([a-zA-Z0-9]+)', final_url)
+            if m:
+                note_id = m.group(1)
+                # 데스크탑 전용 깔끔한 주소로 강제 조립
+                return f"https://www.xiaohongshu.com/explore/{note_id}"
+            else:
+                return final_url
+        except Exception as e:
+            print(f"⚠️ 모바일 링크 원본 추적 실패: {e}")
+            pass
+            
+    return url
 
 
 def extract_video_url_from_page(url: str) -> dict:

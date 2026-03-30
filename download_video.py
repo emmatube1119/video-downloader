@@ -1,369 +1,112 @@
 """
-영상 다운로드 도구
-==================
-샤오홍슈(레드노트), 테무 등 다양한 플랫폼의 영상을 다운로드합니다.
-Playwright로 브라우저를 열어 영상 URL을 추출한 뒤 다운로드합니다.
-
-사용법:
-    python download_video.py <영상_URL> [저장_폴더] [--name 파일명]
-
-예시:
-    python download_video.py https://www.rednote.com/explore/... outcome
-    python download_video.py https://www.rednote.com/explore/... outcome --name 내영상
+영상 다운로드 도구 v25.0 (쿠팡 파트너스 키워드 연동 및 ETA 엔진 탑재)
 """
-
-import sys
-import os
-import re
-import json
-import requests
+import sys, os, re, json, requests, threading, time
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
+from coupang_api import extract_keywords
 
+progress_info = {}
 
-def normalize_url(url: str) -> str:
-    """rednote.com 등 모바일/단축 URL을 xiaohongshu.com 데스크탑 원본 URL로 변환합니다."""
-    url = url.replace("www.rednote.com", "www.xiaohongshu.com").replace("rednote.com", "www.xiaohongshu.com")
-    
-    # xhslink, v.xiaohongshu.com 등 모바일 공유 링크인 경우
-    if "xhslink.com" in url or "v.xiaohongshu.com" in url or "/discovery/item/" in url:
+def init_prog(tid="default"): 
+    progress_info[tid] = {
+        "status":"idle", "percent":0, "downloaded_mb":0.0, "total_mb":0.0, 
+        "title":"", "message":"준비 중", "start_time": time.time(), "elapsed": 0, "eta": "계측 중...",
+        "keywords": ""
+    }
+
+def set_prog(tid, k, v):
+    if tid not in progress_info: init_prog(tid)
+    progress_info[tid][k] = v
+    # 실시간 정보 갱신
+    t = progress_info[tid]
+    if t["status"] not in ["done", "error"]:
+        elapsed = time.time() - t["start_time"]
+        t["elapsed"] = round(elapsed, 1)
+        # ETA 계산 (다운로드 중일 때만 유효)
+        if t["status"] == "downloading" and t["downloaded_mb"] > 0 and t["total_mb"] > 0:
+            speed = t["downloaded_mb"] / elapsed # MB/s
+            rem_mb = t["total_mb"] - t["downloaded_mb"]
+            if speed > 0:
+                rem_sec = int(rem_mb / speed)
+                t["eta"] = f"약 {rem_sec}초 남음" if rem_sec < 60 else f"약 {rem_sec//60}분 {rem_sec%60}초 남음"
+            else: t["eta"] = "계측 중..."
+        elif t["status"] == "merging": t["eta"] = "병합 중 (약 1분 내외)"
+        elif t["status"] == "done": t["eta"] = "완료됨"
+        else: t["eta"] = "분석 중..."
+
+def get_prog(tid): return progress_info.get(tid, {"status":"idle", "percent":0})
+
+def normalize_url(url):
+    if not url.startswith("http"): return url
+    if any(d in url for d in ["xhslink.com", "vt.tiktok.com", "tiktok.com/t/"]):
         try:
-            # 리다이렉트를 추적하여 최종 URL 확보
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            r = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
-            final_url = r.url
-            
-            # /item/ 또는 /explore/ 뒤의 노트 ID 추출
-            m = re.search(r'(?:item|explore)/([a-zA-Z0-9]+)', final_url)
-            if m:
-                note_id = m.group(1)
-                # 데스크탑 전용 깔끔한 주소로 강제 조립
-                return f"https://www.xiaohongshu.com/explore/{note_id}"
-            else:
-                return final_url
-        except Exception as e:
-            print(f"⚠️ 모바일 링크 원본 추적 실패: {e}")
-            pass
-            
+            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True, timeout=10)
+            return r.url
+        except: return url
     return url
 
-
-def extract_video_url_from_page(url: str) -> dict:
-    """Playwright로 페이지를 열어 영상/이미지 정보를 추출합니다.
-
-    Returns:
-        dict: {
-            'title': str,
-            'type': 'video' | 'image',
-            'video_url': str (영상인 경우),
-            'image_urls': list[str] (이미지인 경우),
-        }
-    """
-    url = normalize_url(url)
-    result = {"title": "", "type": "", "video_url": "", "image_urls": []}
-    video_urls_found = []
-
-    # --- 1단계: yt-dlp를 활용한 글로벌 표준 파싱 (특정 도메인은 제외하고 브라우저 파싱으로 직행) ---
-    exclude_domains = ["xiaohongshu.com", "xhslink.com", "taobao.com", "1688.com", "temu.com"]
-    if not any(domain in url for domain in exclude_domains):
+def download_video_and_info(url, task_id="default", out_dir="outcome", custom_name=""):
+    set_prog(task_id, "status", "extracting"); set_prog(task_id, "message", "엔진 가동..."); url = normalize_url(url)
+    is_tk = "tiktok" in url; is_xhs = "xiaohongshu" in url
+    
+    if any(d in url for d in ["youtube.com", "youtu.be", "instagram.com"]):
         try:
             import yt_dlp
-            print(f"🔍 범용 라이브러리(yt-dlp)로 분석 시도 중...")
-            ydl_opts = {
-                "quiet": True,
-                "noplaylist": True,
-                "format": "best[ext=mp4]/best", # 단일 파일 형태(비디오+오디오 통합) 최우선
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info and info.get("url"):
-                    print("✅ 범용 라이브러리 분석 성공!")
-                    result["title"] = info.get("title", "untitled")
-                    result["type"] = "video"
-                    result["video_url"] = info.get("url")
-                    result["extractor"] = "ytdlp"
-                    return result
-        except Exception as e:
-            print(f"⚠️ yt-dlp 파싱 실패, 브라우저 스니핑으로 전환합니다: {e}")
-            pass
+            set_prog(task_id, "message", "유튜브 고화질 분석..."); fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+            with yt_dlp.YoutubeDL({"quiet":True,"noplaylist":True,"format":fmt}) as ydl:
+                info = ydl.extract_info(url, download=False); bn = sanitize_filename(custom_name or info.get("title","video"))
+                fp = unique_filepath(os.path.join(out_dir, f"{bn}.mp4")); set_prog(task_id, "title", os.path.basename(fp))
+                set_prog(task_id, "keywords", extract_keywords(info.get("title","")))
+                def hook(d):
+                    if d['status'] == 'downloading':
+                        try:
+                            v = d.get('downloaded_bytes', 0); t = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                            p = d.get('_percent_str', '0%').replace('%','').strip()
+                            set_prog(task_id,"percent",int(float(p))); set_prog(task_id,"downloaded_mb",round(v/1048576,2)); set_prog(task_id,"total_mb",round(t/1048576,2))
+                            set_prog(task_id,"status","downloading"); set_prog(task_id,"message","고화질 다운로드 중...")
+                        except: pass
+                    elif d['status'] == 'finished': set_prog(task_id,"status","merging"); set_prog(task_id,"message", "병합 작업 중...")
+                opts = {"quiet":True,"noplaylist":True,"format":fmt,"outtmpl":fp,"progress_hooks":[hook],"merge_output_format":"mp4","postprocessor_args":["-y","-c:v","copy","-c:a","aac","-b:a","192k"]}
+                with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
+                sz = os.path.getsize(fp) if os.path.exists(fp) else 0
+                set_prog(task_id,"total_mb",round(sz/1048576,2)); set_prog(task_id,"downloaded_mb",round(sz/1048576,2))
+                set_prog(task_id,"status","done"); set_prog(task_id,"percent",100); set_prog(task_id,"message", "완료!"); return True
+        except Exception as e: set_prog(task_id, "status", "error"); set_prog(task_id, "message", f"오류: {str(e)[:40]}")
 
-    # --- 2단계: 브라우저 자동화(Playwright) 및 네트워크 스니핑 (샤오홍슈, 타오바오 등) ---
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="ko-KR",
-        )
-        page = context.new_page()
-
-        # 네트워크 요청에서 영상 URL 수집 (강력한 스니핑)
-        def on_response(response):
-            try:
-                content_type = response.headers.get("content-type", "").lower()
-                req_url = response.url.lower()
-                
-                # 비디오 형식이나 확장자를 가진 모든 트래픽 감청
-                if "video" in content_type or ".mp4" in req_url or "sns-video" in req_url or ".m3u8" in req_url:
-                    # 너무 짧거나 쓸모없는 리소스 제외
-                    if "video_urls_found" not in locals(): pass
-                    video_urls_found.append(response.url)
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        print(f"🌐 브라우저 분석 중: {url}")
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15" if is_tk else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = context.new_page(); v_url = ""; v_found = []
+        page.on("response", lambda r: v_found.append(r.url) if (("video" in (r.headers.get("content-type") or "") or ".mp4" in r.url.lower()) and "logo" not in r.url.lower()) else None)
         try:
-            # 샤오홍슈 모바일 단축링크(xhslink) 등은 리다이렉트를 기다려야 하므로 domcontentloaded 유지 
-            page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            
-            # 페이지가 완전히 로딩되고 XHR 요청이 끝날 때까지 조금 더 대기 (쇼핑몰 동영상 로딩용)
-            page.wait_for_timeout(4000)
-        except Exception:
-            # 타임아웃이어도 계속 진행 (이미 스니핑된 데이터가 있을 수 있음)
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=25000); page.wait_for_timeout(5000)
+            e_js = """() => { const s = window.__INITIAL_STATE__ || window.SIGI_STATE || (document.getElementById('initialState')||{}).textContent; return (typeof s === 'string') ? s : (window.__INITIAL_STATE__?.note?.note ? JSON.stringify({note: window.__INITIAL_STATE__.note.note}) : (window.SIGI_STATE ? JSON.stringify(window.SIGI_STATE) : null)); }"""
+            st = page.evaluate(e_js); title = page.title() or "video"
+            if st:
+                try:
+                    d = json.loads(st); n = d.get("note") or d.get("props",{}).get("pageProps") or d.get("ItemModule") or d
+                    if "ItemModule" in d: it = d["ItemModule"].get(next(iter(d["ItemModule"],""),""),{}); v_url = it.get("video",{}).get("downloadAddr",""); title = it.get("desc", title)
+                    if not v_url: v_o = n.get("video") or (n if "play_addr" in n else None); v_url = (v_o or {}).get("downloadAddr") or (v_o or {}).get("url"); title = (n or {}).get("title") or (n or {}).get("desc") or title
+                except: pass
+            if not v_url and v_found: v_url = v_found[-1]
+            if v_url:
+                os.makedirs(out_dir, exist_ok=True); bn = sanitize_filename(custom_name or title)
+                fp = unique_filepath(os.path.join(out_dir, f"{bn}.mp4")); set_prog(task_id, "title", os.path.basename(fp))
+                set_prog(task_id, "keywords", extract_keywords(title))
+                set_prog(task_id, "status", "downloading"); set_prog(task_id, "message", "보안 전송 중...")
+                resp = context.request.get(v_url, headers={"Referer": url})
+                if resp.status == 200:
+                    body = resp.body(); total = len(body); set_prog(task_id, "total_mb", round(total/1048576, 2)); set_prog(task_id, "downloaded_mb", round(total/1048576, 2))
+                    with open(fp, "wb") as f: f.write(body)
+                    set_prog(task_id, "status", "done"); set_prog(task_id, "percent", 100); set_prog(task_id, "message", "완료!"); return True
+            else: raise Exception("주소 탐지 실패")
+        except Exception as e: set_prog(task_id, "status", "error"); set_prog(task_id, "message", str(e))
+        finally: browser.close()
+    return False
 
-        # 방법 1: __INITIAL_STATE__ 에서 추출
-        try:
-            state_json = page.evaluate("""() => {
-                if (window.__INITIAL_STATE__) {
-                    return JSON.stringify(window.__INITIAL_STATE__);
-                }
-                return null;
-            }""")
-            if state_json:
-                data = json.loads(state_json)
-                note_section = data.get("note", {})
-                detail_map = note_section.get("noteDetailMap", {})
-                for nid, ninfo in detail_map.items():
-                    note = ninfo.get("note", {})
-                    if not note:
-                        continue
-                    result["title"] = note.get("title", "") or note.get("desc", "untitled")
-                    result["title"] = result["title"][:80].strip()
-
-                    # 영상 확인
-                    video = note.get("video", {})
-                    if video:
-                        result["type"] = "video"
-                        # media.stream 에서 URL 추출
-                        media = video.get("media", {})
-                        stream = media.get("stream", {})
-                        best_url = ""
-                        for quality, streams in stream.items():
-                            if isinstance(streams, list):
-                                for s in streams:
-                                    master_url = s.get("masterUrl", "")
-                                    if master_url:
-                                        best_url = master_url
-                                        break
-                            if best_url:
-                                break
-                        # consumer.originVideoKey 백업
-                        if not best_url:
-                            consumer = video.get("consumer", {})
-                            origin_key = consumer.get("originVideoKey", "")
-                            if origin_key:
-                                best_url = f"https://sns-video-bd.xhscdn.com/{origin_key}"
-                        result["video_url"] = best_url
-                    else:
-                        # 이미지 노트
-                        result["type"] = "image"
-                        img_list = note.get("imageList", [])
-                        for img in img_list:
-                            url_default = img.get("urlDefault", "")
-                            url_pre = img.get("urlPre", "")
-                            info_list = img.get("infoList", [])
-                            # 가장 큰 이미지 URL
-                            best_img = url_default or url_pre
-                            if info_list:
-                                best_img = info_list[-1].get("url", best_img)
-                            if best_img:
-                                if best_img.startswith("//"):
-                                    best_img = "https:" + best_img
-                                result["image_urls"].append(best_img)
-        except Exception as e:
-            print(f"  __INITIAL_STATE__ 파싱 실패: {e}")
-
-        # 방법 2: 네트워크에서 캡처된 영상 URL 사용 (방법1 실패 시)
-        if result["type"] == "video" and not result["video_url"] and video_urls_found:
-            result["video_url"] = video_urls_found[0]
-        elif not result["type"] and video_urls_found:
-            result["type"] = "video"
-            result["video_url"] = video_urls_found[0]
-
-        # 방법 3: video 태그에서 직접 추출 (쇼핑몰 대응)
-        if result["type"] == "video" and not result["video_url"]:
-            try:
-                video_src = page.evaluate("""() => {
-                    const video = document.querySelector('video');
-                    if (video) {
-                        return video.src || video.querySelector('source')?.src || '';
-                    }
-                    return '';
-                }""")
-                if video_src and video_src.startswith("http"):
-                    result["video_url"] = video_src
-            except Exception:
-                pass
-                
-        # 만약 타입이 지정되지 않았지만 스니핑으로 찾아놓은 비디오가 있다면 강제 할당
-        if not result["type"] and video_urls_found:
-            result["type"] = "video"
-            result["video_url"] = video_urls_found[0]
-
-        # 타이틀 백업
-        if not result["title"]:
-            try:
-                result["title"] = page.title() or "untitled"
-            except Exception:
-                result["title"] = "untitled"
-
-        browser.close()
-
-    return result
-
-
-def sanitize_filename(name: str) -> str:
-    """파일명에 사용할 수 없는 문자를 제거합니다."""
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    name = name.strip()
-    return name[:100] if name else "untitled"
-
-
-# 다운로드 진행률 전역 상태 (웹 GUI에서 참조)
-progress_info = {
-    "status": "idle", # idle, extracting, downloading, done
-    "percent": 0,
-    "downloaded_mb": 0.0,
-    "total_mb": 0.0
-}
-
-def unique_filepath(filepath: str) -> str:
-    """파일이 이미 존재하면 _1, _2... 을 붙여서 고유한 경로를 반환합니다."""
-    if not os.path.exists(filepath):
-        return filepath
-    base, ext = os.path.splitext(filepath)
-    counter = 1
-    while os.path.exists(f"{base}_{counter}{ext}"):
-        counter += 1
-    return f"{base}_{counter}{ext}"
-
-
-def download_file(url: str, filepath: str):
-    """URL에서 파일을 다운로드합니다."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.xiaohongshu.com/",
-    }
-    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        
-        progress_info["status"] = "downloading"
-        progress_info["total_mb"] = total / 1024 / 1024 if total > 0 else 0.0
-
-        with open(filepath, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                progress_info["downloaded_mb"] = downloaded / 1024 / 1024
-                
-                if total > 0:
-                    pct = downloaded / total * 100
-                    progress_info["percent"] = int(pct)
-                    print(f"\r  📥 다운로드 중... {pct:.0f}% ({downloaded // 1024}KB / {total // 1024}KB)", end="", flush=True)
-        print()
-
-
-def download_video(url: str, output_dir: str = "outcome", custom_name: str = ""):
-    """주어진 URL에서 영상/이미지를 다운로드합니다.
-
-    Args:
-        url: 영상 페이지 URL
-        output_dir: 저장할 폴더 경로
-        custom_name: 사용자 지정 파일명 (확장자 제외). 비어있으면 원본 제목 사용.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"🔽 다운로드 시작: {url}")
-    print(f"📂 저장 위치: {output_dir}")
-    if custom_name:
-        print(f"📝 파일명: {custom_name}")
-    print("-" * 50)
-
-    info = extract_video_url_from_page(url)
-
-    if not info["type"]:
-        print("❌ 영상/이미지를 찾을 수 없습니다.")
-        return False
-
-    # 파일명 결정: 사용자 지정 > 원본 제목
-    base_name = sanitize_filename(custom_name) if custom_name else sanitize_filename(info["title"])
-
-    if info["type"] == "video":
-        if not info["video_url"]:
-            print("❌ 영상 URL을 추출할 수 없습니다.")
-            progress_info["status"] = "idle"
-            return False
-        filepath = unique_filepath(os.path.join(output_dir, f"{base_name}.mp4"))
-        print(f"🎬 영상 발견: {info['title']}")
-        print(f"  URL: {info['video_url'][:100]}...")
-        download_file(info["video_url"], filepath)
-        print(f"✅ 저장 완료: {filepath}")
-
-    elif info["type"] == "image":
-        print(f"🖼️ 이미지 {len(info['image_urls'])}장 발견: {info['title']}")
-        for i, img_url in enumerate(info["image_urls"]):
-            ext = ".jpg"
-            if ".png" in img_url:
-                ext = ".png"
-            elif ".webp" in img_url:
-                ext = ".webp"
-            filepath = unique_filepath(os.path.join(output_dir, f"{base_name}_{i+1}{ext}"))
-            print(f"  [{i+1}/{len(info['image_urls'])}] 다운로드 중...")
-            download_file(img_url, filepath)
-            print(f"  ✅ 저장: {filepath}")
-
-    progress_info["status"] = "done"
-    return True
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("=" * 50)
-        print("  영상 다운로드 도구")
-        print("=" * 50)
-        print()
-        print("사용법: python download_video.py <URL> [저장폴더] [--name 파일명]")
-        print()
-        print("지원 플랫폼: 샤오홍슈(레드노트), 기타")
-        print()
-        print("예시:")
-        print("  python download_video.py https://www.rednote.com/explore/...")
-        print("  python download_video.py https://www.rednote.com/explore/... outcome --name 내영상")
-        sys.exit(1)
-
-    video_url = sys.argv[1]
-    out_dir = "outcome"
-    custom_name = ""
-
-    # 인자 파싱
-    args = sys.argv[2:]
-    i = 0
-    while i < len(args):
-        if args[i] == "--name" and i + 1 < len(args):
-            custom_name = args[i + 1]
-            i += 2
-        else:
-            out_dir = args[i]
-            i += 1
-
-    success = download_video(video_url, out_dir, custom_name)
-    if not success:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+def sanitize_filename(f): return re.sub(r'[\\/*?:"<>|]', "", f or "video").strip()[:100]
+def unique_filepath(p):
+    b, e = os.path.splitext(p); c = 1; n = p
+    while os.path.exists(n): n = f"{b} ({c}){e}"; c += 1
+    return n

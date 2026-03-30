@@ -54,6 +54,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <script>
         let tasks = {};
         let recCache = {};
+        let clientId = localStorage.getItem('df_client_id');
+        if(!clientId) { clientId = 'c_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9); localStorage.setItem('df_client_id', clientId); }
         function start() {
             const url = document.getElementById('urlInput').value.trim();
             const name = document.getElementById('nameInput').value.trim();
@@ -61,13 +63,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const tid = 't_' + Date.now();
             tasks[tid] = { status:'prep', percent:0, title:'&#48516;&#49437; &#51473;...', message:'&#51104;&#49884;&#47564; &#44592;&#45796;&#47140;&#51452;&#49464;&#50836;', elapsed:0, eta:'...', downloaded_mb:0, total_mb:0, keywords:'' };
             render();
-            fetch('/download', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`url=${encodeURIComponent(url)}&filename=${encodeURIComponent(name)}&task_id=${tid}` });
+            fetch('/download', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:`url=${encodeURIComponent(url)}&filename=${encodeURIComponent(name)}&task_id=${tid}&client_id=${clientId}` });
             document.getElementById('urlInput').value = '';
             document.getElementById('nameInput').value = '';
         }
         setInterval(async () => {
             try {
-                const r = await fetch('/progress'); const d = await r.json();
+                const r = await fetch('/progress?client_id=' + clientId); const d = await r.json();
                 for(const [id, info] of Object.entries(d)) {
                     tasks[id] = info;
                     if(info.keywords && !recCache[id]) {
@@ -129,9 +131,11 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer): daemon_threads = True
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
-        if self.path == "/progress":
+        if self.path.startswith("/progress"):
+            cid = parse_qs(self.path.split("?",1)[1] if "?" in self.path else "").get("client_id",[""])[0]
+            filtered = {k: v for k, v in progress_info.items() if v.get("client_id") == cid} if cid else progress_info
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
-            self.wfile.write(json.dumps(progress_info).encode("utf-8")); return
+            self.wfile.write(json.dumps(filtered).encode("utf-8")); return
         if self.path.startswith("/recommend"):
             kw = parse_qs(self.path.split("?",1)[1] if "?" in self.path else "").get("keyword",[""])[0]
             results = search_products(kw, limit=2)
@@ -160,8 +164,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/download":
             body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8")
             params = parse_qs(body)
-            url, name, tid = params.get("url",[""])[0], params.get("filename",[""])[0], params.get("task_id",[""])[0]
-            init_prog(tid); self.send_response(200); self.end_headers()
+            url, name, tid, cid = params.get("url",[""])[0], params.get("filename",[""])[0], params.get("task_id",[""])[0], params.get("client_id",[""])[0]
+            init_prog(tid); set_prog(tid, "client_id", cid); self.send_response(200); self.end_headers()
             def run():
                 try: download_video_and_info(url, task_id=tid, out_dir=OUTPUT_DIR, custom_name=name)
                 except Exception as e: set_prog(tid, "status", "error"); set_prog(tid, "message", str(e))

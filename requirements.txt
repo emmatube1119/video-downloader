@@ -2,4 +2,3 @@ flask
 playwright
 requests
 yt-dlp
-gunicorn

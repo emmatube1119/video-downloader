@@ -1,7 +1,7 @@
 import os, sys, json, re, threading, webbrowser, requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = "outcome"
@@ -101,6 +101,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     }
                     recHTML += '</div>';
                 }
+                let dlBtnHtml = '';
+                if(done && info.title) {
+                    dlBtnHtml = `<a href="/download_file?task_id=${id}" style="display:block; margin-top:12px; padding:12px; background:linear-gradient(90deg, #10b981, #34d399); color:white; border-radius:12px; text-decoration:none; font-weight:700; font-size:0.95rem; text-align:center; box-shadow:0 4px 10px rgba(16,185,129,0.3); transition:0.2s;">&#128229; 내 기기로 영상 파일 받기</a>`;
+                }
                 el.innerHTML = `
                     <div class="badge-timer">&#9201; ${info.elapsed}s | ${done?'OK':(info.eta||'...')}</div>
                     <div class="task-title">${info.title || '&#48516;&#49437; &#51473;...'}</div>
@@ -110,6 +114,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         <span style="font-weight:700; color:${color}; font-size:0.9rem;">${info.percent}%</span>
                         <span class="filesize">${info.downloaded_mb}MB / ${info.total_mb}MB</span>
                     </div>
+                    ${dlBtnHtml}
                     ${recHTML}
                 `;
             });
@@ -132,6 +137,22 @@ class Handler(BaseHTTPRequestHandler):
             results = search_products(kw, limit=2)
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(json.dumps(results).encode("utf-8")); return
+        if self.path.startswith("/download_file"):
+            tid = parse_qs(self.path.split("?",1)[1] if "?" in self.path else "").get("task_id",[""])[0]
+            info = progress_info.get(tid, {})
+            title = info.get("title", "")
+            if title:
+                fp = os.path.join(OUTPUT_DIR, title)
+                if os.path.exists(fp):
+                    sz = os.path.getsize(fp)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(title)}")
+                    self.send_header("Content-Length", str(sz))
+                    self.end_headers()
+                    with open(fp, "rb") as f: self.wfile.write(f.read())
+                    return
+            self.send_response(404); self.end_headers(); return
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
         self.wfile.write(HTML_PAGE.encode("utf-8"))
 

@@ -1,4 +1,4 @@
-flask
 playwright
 requests
 yt-dlp
+python-dotenv

@@ -1,5 +1,4 @@
-flask
 playwright
 requests
 yt-dlp
-gunicorn
+python-dotenv

@@ -5,7 +5,7 @@ from urllib.parse import parse_qs
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = "outcome"
-PORT = 8085
+PORT = int(os.environ.get("PORT", 8085))
 
 from download_video import init_prog, set_prog, get_prog, download_video_and_info, progress_info
 from coupang_api import search_products
@@ -147,7 +147,11 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run, daemon=True).start()
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True); server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Download Flow: http://localhost:{PORT}"); webbrowser.open(f"http://localhost:{PORT}"); server.serve_forever()
+    os.makedirs(OUTPUT_DIR, exist_ok=True); server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"PASTEL-FLOW: http://localhost:{PORT}")
+    try:
+        if not os.environ.get("RENDER"): webbrowser.open(f"http://localhost:{PORT}")
+    except: pass
+    server.serve_forever()
 
 if __name__ == "__main__": main()
